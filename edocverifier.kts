@@ -4,6 +4,7 @@ import com.google.zxing.client.j2se.BufferedImageLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 import kz.gov.pki.kalkan.jce.provider.KalkanProvider
 import kz.gov.pki.kalkan.util.encoders.Base64
+import kz.gov.pki.kalkan.util.encoders.Hex
 import kz.gov.pki.kalkan.xmldsig.KncaXS
 import javax.imageio.ImageIO
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -19,9 +20,13 @@ import java.util.zip.ZipInputStream
 import javax.xml.parsers.DocumentBuilderFactory
 import javax.xml.stream.XMLInputFactory
 
+val TYPE_BARCODEELEMENT = "BarcodeElement"
+val TYPE_QRCODEPAYCHECK = "QRCodePayCheck"
+
 try {
     val pdoc = PDDocument.load(File(args[0]))
     var elamount: Int = 0
+    var eltype: String = ""
     val partsMap = mutableMapOf<Int, String>()
     val baos = ByteArrayOutputStream()
     pdoc.pages.forEach { page ->
@@ -38,7 +43,7 @@ try {
                                     ImageIO.read(ByteArrayInputStream(baos.toByteArray())))))
                     val qrCodeResult = MultiFormatReader().decode(binaryBitmap)
                     val xml = qrCodeResult.text
-                    println("qrxml: $xml")
+                    println("+++ qrxml: $xml")
                     val xfac = XMLInputFactory.newFactory()
                     val xsr = try {
                         val sr = xfac.createXMLStreamReader(xml.byteInputStream(), "UTF-8")
@@ -51,21 +56,26 @@ try {
                     }
                     var elnum: Int = 0
                     var eldata: String = ""
-                    println(xsr.localName)
+                    eltype = xsr.localName
+                    println("+++ [$eltype] +++")
                     when (xsr.localName) {
-                        "BarcodeElement" -> {
+                        TYPE_BARCODEELEMENT -> {
                             while (xsr.hasNext()) {
                                 if (xsr.isStartElement) {
                                     when (xsr.localName) {
                                         "elementData" -> eldata = xsr.elementText
                                         "elementNumber" -> elnum = xsr.elementText.toInt()
                                         "elementsAmount" -> elamount = xsr.elementText.toInt()
+                                        // another type of document :(
+                                        "Content" -> eldata = xsr.elementText
+                                        "ElementNumber" -> elnum = xsr.elementText.toInt()
+                                        "TotalElementsCount" -> elamount = xsr.elementText.toInt()
                                     }
                                 }
                                 xsr.next()
                             }
                         }
-                        "QRCodePayCheck" -> {
+                        TYPE_QRCODEPAYCHECK -> {
                             while (xsr.hasNext()) {
                                 if (xsr.isStartElement) {
                                     when (xsr.localName) {
@@ -85,15 +95,30 @@ try {
             }
         }
     }
+    pdoc.close()
+    println("+++ Total parts: $elamount +++")
     if (elamount != partsMap.size) {
         throw IllegalArgumentException("Found ${partsMap.size} parts instead of $elamount")
     }
     baos.reset()
     for (entry in partsMap.toSortedMap()) {
         println(entry.value)
-        baos.write(Base64.decode(entry.value))
+        if (eltype == TYPE_QRCODEPAYCHECK) {
+            baos.write(entry.value.toByteArray())
+        } else {
+            baos.write(Base64.decode(entry.value))
+        }
     }
-    val compressed = baos.toByteArray()
+    val joinedBytes = baos.toByteArray()
+    val compressed = if (eltype == TYPE_QRCODEPAYCHECK) {
+        Base64.decode(joinedBytes)
+    } else {
+        if (joinedBytes[0] == 0x5D.toByte() || joinedBytes[0] == 0x50.toByte()) {
+            joinedBytes
+        } else {
+            Base64.decode(joinedBytes)
+        }
+    }
     if (compressed[0] == 0x50.toByte() && compressed[1] == 0x4B.toByte()) {
         ZipInputStream(ByteArrayInputStream(compressed)).use {
             baos.reset()
@@ -106,7 +131,12 @@ try {
             baos.write(it.readBytes())
         }
     }
-    val extracted = baos.toByteArray()
+    val outbytes = baos.toByteArray()
+    val extracted = if (outbytes[0] == 0x3C.toByte()) {
+        outbytes
+    } else {
+        Base64.decode(outbytes)
+    }
     println(String(extracted))
     Security.addProvider(KalkanProvider())
     KncaXS.loadXMLSecurity()
@@ -135,6 +165,8 @@ try {
     val cert = xsig.keyInfo.x509Certificate
     println("Verification status: ${xsig.checkSignatureValue(cert)}")
     println(cert.subjectDN)
+    println("${Hex.encodeStr(cert.serialNumber.toByteArray())} - ${cert.serialNumber}")
+    println("${cert.notBefore} - ${cert.notAfter}")
     cert.checkValidity()
 } catch (e: Exception) {
     e.printStackTrace()
